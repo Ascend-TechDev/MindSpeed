@@ -736,13 +736,6 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 candidates.candidate_blocks,
                 getattr(candidates.compress_context, "valid_mask", None),
             )
-        local_compressed = _CPCompressor(
-            self.compressor,
-            freqs,
-            not runtime.is_bsnd,
-            prepared_candidate=shared_candidate,
-        ).compress(candidates.candidate_blocks, candidates.compress_context)
-        pending = launch_deepseek_v4_allgather_compressed_kv(candidates, local_compressed)
         indexer_pending = None
         if self.indexer is not None and getattr(self.indexer, "kv_compressor", None) is not None:
             indexer_candidates = replace(
@@ -775,6 +768,15 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 indexer_candidates,
                 indexer_compressed,
             )
+        # Issue the Indexer collective first so its keys can be consumed while
+        # the main compressed-KV all-gather is still in flight.
+        local_compressed = _CPCompressor(
+            self.compressor,
+            freqs,
+            not runtime.is_bsnd,
+            prepared_candidate=shared_candidate,
+        ).compress(candidates.candidate_blocks, candidates.compress_context)
+        pending = launch_deepseek_v4_allgather_compressed_kv(candidates, local_compressed)
         return (
             previous_ori,
             previous_source,
@@ -906,28 +908,24 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 global_freqs if packed_seq_params is None else global_freqs,
                 ratio,
             )
-            prepared_kv = wait_deepseek_v4_compressed_kv(pending)
-            compacted_kv, block_starts = compact_deepseek_v4_compressed_kv(
-                prepared_kv,
-                seq_dim=runtime.seq_dim,
-            )
-            ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
-                runtime,
-                previous_ori,
-                packed_seq_params is not None,
-            )
             if self.indexer is not None:
                 if indexer_pending is None:
                     raise RuntimeError("C4A requires an indexer compressed-key path.")
-                indexer_key, _ = compact_deepseek_v4_compressed_kv(
-                    wait_deepseek_v4_compressed_kv(indexer_pending),
-                    seq_dim=runtime.seq_dim,
-                )
+                # These projections only use local inputs; enqueue them before
+                # either collective wait to overlap with CP communication.
                 query_index, weights = self.indexer.forward_query_weights(
                     hidden_for_compress.detach(),
                     q_compressed.detach(),
                     local_freqs,
                 )
+                prepared_indexer = wait_deepseek_v4_compressed_kv(indexer_pending)
+                indexer_key, indexer_block_starts = compact_deepseek_v4_compressed_kv(
+                    prepared_indexer,
+                    seq_dim=runtime.seq_dim,
+                )
+                # Both compressors share the candidate metadata and compact
+                # order. Top-k needs only Indexer keys and their block starts,
+                # not the main KV values or completion of their all-gather.
                 if runtime.is_bsnd:
                     key_index = indexer_key
                 elif indexer_key.dim() == 4:
@@ -955,20 +953,20 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                             0,
                             identity_single_sample=(
                                 packed_seq_params is None
-                                and bool(getattr(prepared_kv.metadata, "is_identity_compact_order", False))
+                                and bool(getattr(prepared_indexer.metadata, "is_identity_compact_order", False))
                                 and (runtime.batch_size == 1 or runtime.is_bsnd)
                             ),
                             layout=runtime.layout,
                         )
                     cmp, cmp_is_causal = finalize_deepseek_v4_fused_indexer_compact_indices(
                         cmp,
-                        block_starts,
+                        indexer_block_starts,
                         ratio,
                         runtime.shared_cu_seqlens_global() if runtime.is_bsnd else runtime.cu_seqlens_global,
                         runtime.shared_query_positions() if runtime.is_bsnd else runtime.query_positions,
                         identity_compact_order=(
                             packed_seq_params is None
-                            and bool(getattr(prepared_kv.metadata, "is_identity_compact_order", False))
+                            and bool(getattr(prepared_indexer.metadata, "is_identity_compact_order", False))
                             and (runtime.batch_size == 1 or runtime.is_bsnd)
                         ),
                         layout=runtime.layout,
@@ -981,13 +979,25 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                         key_index,
                         weights,
                         runtime.query_positions,
-                        block_starts,
+                        indexer_block_starts,
                         ratio,
                         runtime.cu_seqlens_global,
                         self.indexer.index_topk,
                         layout=runtime.layout,
                     )
-            elif ratio == 4:
+            # Defer the main KV dependency until after Indexer top-k, allowing
+            # both Indexer projections and selection to hide its communication.
+            prepared_kv = wait_deepseek_v4_compressed_kv(pending)
+            compacted_kv, block_starts = compact_deepseek_v4_compressed_kv(
+                prepared_kv,
+                seq_dim=runtime.seq_dim,
+            )
+            ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
+                runtime,
+                previous_ori,
+                packed_seq_params is not None,
+            )
+            if self.indexer is None and ratio == 4:
                 valid_mask = torch.ones_like(block_starts, dtype=torch.bool)
                 cmp = build_deepseek_v4_causal_cmp_sparse_indices(
                     runtime.query_positions,
@@ -999,8 +1009,6 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 )
                 if runtime.is_bsnd:
                     cmp = cmp.reshape(runtime.batch_size, runtime.seq_len, -1)
-            else:
-                cmp = None
         else:
             ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
                 runtime,
