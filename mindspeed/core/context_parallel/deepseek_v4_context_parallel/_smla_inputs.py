@@ -5,6 +5,7 @@ from typing import Optional
 
 import torch
 
+from ._static_csa import DeepSeekV4CPStaticCSAPlan, sanitize_static_csa_indices
 from ._types import (
     DeepSeekV4CPAlignmentDescriptor,
     DeepSeekV4CPCompressedKV,
@@ -135,6 +136,7 @@ def build_deepseek_v4_owned_runtime_metadata(
     q_seq_dim: Optional[int] = None,
     ori_kv_seq_dim: Optional[int] = None,
     cmp_seq_dim: Optional[int] = None,
+    static_csa_plan: Optional[DeepSeekV4CPStaticCSAPlan] = None,
 ) -> DeepSeekV4CPRuntimeMetadata:
     """Assemble Attention-owned runtime metadata without re-validating tensors."""
     device = query.device
@@ -145,6 +147,15 @@ def build_deepseek_v4_owned_runtime_metadata(
     cu_ori = _to_int32_tensor(cu_seqlens_ori_kv, device)
     cu_global = _to_int32_tensor(cu_seqlens_global, device)
     positions = query_positions.to(device=device, dtype=torch.long).reshape(-1)
+    if static_csa_plan is not None:
+        if not isinstance(static_csa_plan, DeepSeekV4CPStaticCSAPlan):
+            raise TypeError("static_csa_plan must be a DeepSeekV4CPStaticCSAPlan.")
+        if layout != "BSND" or compression_ratio != 4 or (
+            int(batch_size), int(query.shape[q_seq_dim])
+        ) != (static_csa_plan.batch_size, static_csa_plan.query_length) or (
+            q_seq_dim, ori_kv_seq_dim, cmp_seq_dim
+        ) != (1, 1, 1):
+            raise ValueError("Static CSA plan requires matching BSND query shape and compression_ratio=4.")
 
     cu_seqlens_cmp_kv = None
     cmp_residual_kv = None
@@ -176,6 +187,7 @@ def build_deepseek_v4_owned_runtime_metadata(
         layout_q=layout,
         layout_kv=layout,
         batch_size=int(batch_size),
+        static_csa_plan=static_csa_plan,
     )
 
 
@@ -738,6 +750,66 @@ def _get_deepseek_v4_cmp_visibility_inputs(
     return local_query_positions, shared_cu_seqlens
 
 
+def _build_static_csa_smla_inputs(
+    q,
+    ori_kv,
+    full_cmp_kv,
+    full_block_starts,
+    cmp_sparse_indices,
+    runtime_metadata,
+    metadata=None,
+):
+    """Lower the producer-owned BSND plan without reading any device values.
+
+    The caller establishes identity compact order from compression metadata.
+    Both SMLA and Indexer-loss keys must consume this same prefix descriptor.
+    """
+    plan = runtime_metadata.static_csa_plan
+    if not isinstance(plan, DeepSeekV4CPStaticCSAPlan):
+        raise TypeError("static_csa_plan must be a DeepSeekV4CPStaticCSAPlan.")
+    if q.dim() != 4 or tuple(q.shape[:2]) != (plan.batch_size, plan.query_length):
+        raise ValueError("Static CSA plan does not match SMLA query shape.")
+    if full_cmp_kv.dim() != 4 or tuple(full_cmp_kv.shape[:3]) != (plan.batch_size, plan.global_blocks, 1):
+        raise ValueError("Static CSA requires full BSND compressed KV in identity compact order.")
+    if full_block_starts.dim() != 1 or full_block_starts.numel() != plan.global_blocks:
+        raise ValueError("Static CSA block starts must match the global compressed capacity.")
+    if metadata is not None and plan.query_end != plan.global_length:
+        raise ValueError("Pass metadata=None when the static CSA plan crops the compressed prefix.")
+
+    device = q.device
+    selected = torch.arange(plan.prefix_blocks, dtype=torch.long, device=device)
+    global_rows = torch.arange(plan.global_blocks, dtype=torch.long, device=device)
+    alignment = DeepSeekV4CPAlignmentDescriptor(
+        full_block_starts=full_block_starts,
+        selected_global_indices=selected,
+        global_to_local=torch.where(global_rows < plan.prefix_blocks, global_rows, -1),
+        block_starts=full_block_starts.narrow(0, 0, plan.prefix_blocks),
+        cu_seqlens_cmp_kv=torch.arange(plan.batch_size + 1, dtype=torch.int32, device=device) * plan.prefix_blocks,
+        cmp_residual_kv=torch.full((plan.batch_size,), plan.residual, dtype=torch.int32, device=device),
+        is_identity_prefix=True,
+    )
+    flat_indices = _flatten_deepseek_v4_cmp_sparse_indices(cmp_sparse_indices, q, "BSND")
+    indices = flat_indices.reshape(plan.batch_size, plan.query_length, flat_indices.shape[-1])
+    # O(B*S*TopK) checks on device. Keep the original all-padding-row fallback,
+    # while explicitly discarding future/padded/out-of-range keys in one place.
+    indices = sanitize_static_csa_indices(indices, plan, fill_empty_rows=True)
+    return DeepSeekV4CPSMLAInputs(
+        q=q,
+        ori_kv=ori_kv,
+        cmp_kv=align_deepseek_v4_cp_tensor(full_cmp_kv, alignment, 1, tensor_name="cmp_kv"),
+        cmp_sparse_indices=indices.unsqueeze(2).contiguous(),
+        cu_seqlens_q=runtime_metadata.cu_seqlens_q,
+        cu_seqlens_ori_kv=runtime_metadata.cu_seqlens_ori_kv,
+        cu_seqlens_cmp_kv=alignment.cu_seqlens_cmp_kv,
+        seqused_ori_kv=runtime_metadata.seqused_ori_kv,
+        seqused_cmp_kv=runtime_metadata.seqused_cmp_kv,
+        cmp_residual_kv=alignment.cmp_residual_kv,
+        metadata=metadata,
+        block_starts=alignment.block_starts,
+        alignment=alignment,
+    )
+
+
 def build_deepseek_v4_cp_smla_inputs(
     q: torch.Tensor,
     ori_kv: torch.Tensor,
@@ -793,6 +865,16 @@ def build_deepseek_v4_cp_smla_inputs(
             full_cmp_kv, full_block_starts = compact_deepseek_v4_compressed_kv(
                 prepared_compressed_kv,
                 seq_dim=runtime_metadata.cmp_seq_dim,
+            )
+        if (
+            runtime_metadata.static_csa_plan is not None
+            and compression_ratio == 4
+            and layout_q == layout_kv == "BSND"
+            and prepared_compressed_kv.metadata.is_identity_compact_order
+            and prepared_compressed_kv.metadata.batch_shared_sequence
+        ):
+            return _build_static_csa_smla_inputs(
+                q, ori_kv, full_cmp_kv, full_block_starts, cmp_sparse_indices, runtime_metadata, metadata
             )
         alignment = _build_deepseek_v4_cp_alignment_descriptor(
             full_block_starts,

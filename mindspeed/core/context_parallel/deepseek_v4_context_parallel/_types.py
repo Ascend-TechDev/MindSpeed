@@ -5,6 +5,8 @@ from typing import Optional, Protocol, Sequence
 
 import torch
 
+from ._static_csa import DeepSeekV4CPStaticCSAPlan
+
 
 class _AsyncCollectiveStateProtocol(Protocol):
     completed: bool
@@ -167,3 +169,4 @@ class DeepSeekV4CPRuntimeMetadata:
     layout_q: str
     layout_kv: str
     batch_size: int
+    static_csa_plan: Optional[DeepSeekV4CPStaticCSAPlan] = None

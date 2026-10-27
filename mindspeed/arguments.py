@@ -242,6 +242,12 @@ def _add_cp_args(parser):
         help='Run non-FP8 CSA Indexer Query/weights on a side stream to overlap the main KV compressor.',
     )
     group.add_argument('--ulysses-degree-in-cp', type=int, default=None)
+    group.add_argument(
+        '--deepseek-v4-cp-static-csa',
+        action='store_true',
+        default=False,
+        help='Use Host-owned fixed BSND plans and device-side index preparation for fused CSA CP.',
+    )
     group.add_argument('--cp-window-size', type=int, default=1)
     group.add_argument(
         '--attention-mask-type',
@@ -605,6 +611,14 @@ def validate_args_wrapper(validate_args):
     def wrapper(args, defaults=None):
         if defaults is None:
             defaults = {}
+        if getattr(args, 'deepseek_v4_cp_static_csa', False):
+            if args.context_parallel_algo != 'deepseek_v4_cp_algo' or args.context_parallel_size <= 1:
+                raise AssertionError(
+                    '--deepseek-v4-cp-static-csa requires '
+                    '--context-parallel-algo deepseek_v4_cp_algo and --context-parallel-size greater than 1.'
+                )
+            if not getattr(args, 'use_fused_lightning_indexer', False):
+                raise AssertionError('--deepseek-v4-cp-static-csa requires --use-fused-lightning-indexer.')
         if getattr(args, 'deepseek_v4_cp_indexer_query_overlap', False):
             if args.context_parallel_algo != 'deepseek_v4_cp_algo' or args.context_parallel_size <= 1:
                 raise AssertionError(
