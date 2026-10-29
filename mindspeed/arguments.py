@@ -235,6 +235,12 @@ def _add_cp_args(parser):
         ],
         help='context parallel algorithm',
     )
+    group.add_argument(
+        '--deepseek-v4-cp-indexer-query-overlap',
+        action='store_true',
+        default=False,
+        help='Run non-FP8 CSA Indexer Query/weights on a side stream to overlap the main KV compressor.',
+    )
     group.add_argument('--ulysses-degree-in-cp', type=int, default=None)
     group.add_argument('--cp-window-size', type=int, default=1)
     group.add_argument(
@@ -599,6 +605,14 @@ def validate_args_wrapper(validate_args):
     def wrapper(args, defaults=None):
         if defaults is None:
             defaults = {}
+        if getattr(args, 'deepseek_v4_cp_indexer_query_overlap', False):
+            if args.context_parallel_algo != 'deepseek_v4_cp_algo' or args.context_parallel_size <= 1:
+                raise AssertionError(
+                    '--deepseek-v4-cp-indexer-query-overlap requires '
+                    '--context-parallel-algo deepseek_v4_cp_algo and --context-parallel-size greater than 1.'
+                )
+            if getattr(args, 'fp8', None):
+                raise AssertionError('--deepseek-v4-cp-indexer-query-overlap does not support FP8 weight caches.')
         replace_model_type_for_deepspeed_moe = False
         if args.num_experts:
             if args.use_ascend_coc:
