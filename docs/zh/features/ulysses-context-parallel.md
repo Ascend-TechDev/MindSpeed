@@ -76,3 +76,7 @@ Ulysses长序列并行是一种针对上述挑战设计的创新方案，它能�
 ## 使用效果
 
 利用多个计算设备对输入序列进行并行切分，降低单设备的内存消耗。相比不开启序列并行，单步耗时增加，但相比重计算，计算效率得到提升。
+
+## 混合模型的 KDA 接入
+
+KDA 与 gated MLA 混合模型可保留 MLA 的 headwise 路径，同时在模型侧为 KDA 调用 FLA chunkwise CP。适用范围、示例和验证方法见 [Kimi KDA 接入说明](kimi-fla-chunkwise-cp.md)。
