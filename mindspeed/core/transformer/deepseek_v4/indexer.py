@@ -113,6 +113,7 @@ class DSAIndexer(MegatronModule):
         compress_ratio=4,
         cmp_residual_k=None,
         return_scores=True,
+        cmp_residual_k_values=None,
     ):
         """Run the fused Lightning Indexer on model-layout tensors.
 
@@ -152,6 +153,7 @@ class DSAIndexer(MegatronModule):
             sparse_mode=3,
             cmp_ratio=int(compress_ratio),
             return_values=return_scores,
+            cmp_residual_k_values=cmp_residual_k_values,
         )
         if int(offset) != 0:
             indices = torch.where(

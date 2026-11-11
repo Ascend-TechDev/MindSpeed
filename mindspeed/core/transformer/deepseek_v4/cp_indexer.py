@@ -15,6 +15,9 @@ import torch
 from mindspeed.core.context_parallel.deepseek_v4_context_parallel import (
     flatten_deepseek_v4_cp_tensor_to_tnd,
 )
+from mindspeed.core.context_parallel.deepseek_v4_context_parallel._static_csa import (
+    DeepSeekV4CPStaticCSAPlan,
+)
 from mindspeed.core.context_parallel.deepseek_v4_context_parallel._utils import (
     enumerate_global_block_starts,
     normalize_cu_seqlens,
@@ -393,6 +396,7 @@ def run_deepseek_v4_right_aligned_fused_indexer(
     start_pos,
     identity_single_sample=False,
     layout="TND",
+    static_csa_plan=None,
 ):
     """Run fused Lightning Indexer on causal right-aligned query segments."""
     if layout == "BSND":
@@ -407,6 +411,7 @@ def run_deepseek_v4_right_aligned_fused_indexer(
             compression_ratio,
             topk,
             start_pos,
+            static_csa_plan=static_csa_plan,
         )
     if layout != "TND":
         raise ValueError(f"Unsupported fused Indexer layout: {layout}.")
@@ -540,6 +545,7 @@ def _run_deepseek_v4_bsnd_right_aligned_fused_indexer(
     compression_ratio,
     topk,
     start_pos,
+    static_csa_plan=None,
 ):
     if query_index.dim() != 4 or weights.dim() != 3 or dsa_hidden_states.dim() != 3:
         raise ValueError("BSND fused Indexer expects model-layout query, weights, and hidden states.")
@@ -556,6 +562,33 @@ def _run_deepseek_v4_bsnd_right_aligned_fused_indexer(
     if ratio <= 0 or topk <= 0:
         raise ValueError("BSND fused Indexer compression_ratio and TopK must be positive.")
     device = query_index.device
+    if static_csa_plan is not None:
+        plan = static_csa_plan
+        if not isinstance(plan, DeepSeekV4CPStaticCSAPlan):
+            raise TypeError("static_csa_plan must be a DeepSeekV4CPStaticCSAPlan.")
+        if (batch_size, seq_len, ratio) != (plan.batch_size, plan.query_length, plan.compression_ratio):
+            raise ValueError("Static CSA plan does not match Indexer query shape or compression ratio.")
+        if key_index.shape[1] != plan.global_blocks:
+            raise ValueError("Static CSA Indexer key length must match the global compressed capacity.")
+        if seq_len == 0 or plan.prefix_blocks == 0:
+            return torch.full((batch_size, seq_len, topk), -1, dtype=torch.int32, device=device)
+        # The CANN BSND right-down mask uses the actual K prefix, not the AG
+        # storage capacity. All slice bounds come from the producer's Host plan.
+        key_prefix = key_index[:, :plan.prefix_blocks].transpose(0, 1).contiguous()
+        indices, _ = indexer.forward_with_scores_compress(
+            query_index.contiguous(),
+            key_prefix,
+            weights.contiguous(),
+            None,
+            topk,
+            0,
+            ratio,
+            cmp_residual_k_values=(plan.residual,) * batch_size,
+            return_scores=False,
+        )
+        indices, _ = _normalize_fused_output(indices, None, "BSND", seq_len, batch_size)
+        return _pad_topk(indices, topk).contiguous()
+
     cu_global = normalize_cu_seqlens(cu_seqlens_global, device, trusted=True).to(dtype=torch.long)
     if cu_global.numel() != batch_size + 1:
         raise ValueError("BSND fused Indexer cu_seqlens must contain one boundary per batch.")

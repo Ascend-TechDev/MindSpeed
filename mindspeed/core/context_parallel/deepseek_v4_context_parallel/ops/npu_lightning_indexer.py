@@ -130,6 +130,7 @@ def npu_lightning_indexer(
     sparse_mode=3,
     cmp_ratio=4,
     return_values=True,
+    cmp_residual_k_values=None,
 ):
     custom_ops = _custom_ops()
     if custom_ops is None:
@@ -173,7 +174,22 @@ def npu_lightning_indexer(
     key_op = normalize_dense_strides(key_op)
     weights_op = normalize_dense_strides(weights_op.float())
 
-    if cmp_residual_k is None:
+    if cmp_residual_k_values is not None:
+        if cmp_residual_k is not None:
+            raise ValueError("Pass either cmp_residual_k or its Host values, not both.")
+        if layout != "BSND":
+            raise ValueError("Host residual values are supported only for the static BSND path.")
+        if not isinstance(cmp_residual_k_values, (tuple, list)) or not all(
+            isinstance(value, int) and not isinstance(value, bool) for value in cmp_residual_k_values
+        ):
+            raise TypeError("cmp_residual_k_values must be a Host sequence of integers.")
+        residual_values = tuple(cmp_residual_k_values)
+        if len(residual_values) != batch_for_metadata or any(
+            value < 0 or value >= int(cmp_ratio) for value in residual_values
+        ):
+            raise ValueError("Host residual values must contain one value in [0, cmp_ratio) per sample.")
+        residual = torch.tensor(residual_values, dtype=torch.int32, device=query.device)
+    elif cmp_residual_k is None:
         residual_value = int(seq_k) % int(cmp_ratio)
         residual_values = (residual_value,) * int(batch_for_metadata)
         residual = torch.full(

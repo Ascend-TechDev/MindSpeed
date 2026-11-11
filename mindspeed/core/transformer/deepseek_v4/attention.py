@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Union
+from typing import Optional, Union
 
 import torch
 from einops import rearrange
@@ -33,6 +33,10 @@ from mindspeed.core.context_parallel.deepseek_v4_context_parallel import (
     flatten_deepseek_v4_cp_tensor_to_tnd,
     build_deepseek_v4_owned_runtime_metadata,
 )
+from mindspeed.core.context_parallel.deepseek_v4_context_parallel._static_csa import (
+    DeepSeekV4CPStaticCSAPlan,
+)
+from mindspeed.core.context_parallel.deepseek_v4_context_parallel._utils import normalize_cu_seqlens
 from mindspeed.core.transformer.custom_layers.transformer_engine import PTNorm
 
 from .compressor import get_compressor_spec
@@ -41,7 +45,6 @@ from .deepseek_utils import (
     build_deepseek_v4_cp_local_packed_position_ids,
     select_deepseek_v4_cp_packed_seq_params,
 )
-from mindspeed.core.context_parallel.deepseek_v4_context_parallel._utils import normalize_cu_seqlens
 from .cp_indexer import (
     build_deepseek_v4_dense_indexer_compact_indices,
     finalize_deepseek_v4_fused_indexer_compact_indices,
@@ -273,6 +276,7 @@ class _CPRuntime:
     batch_size: int
     seq_len: int
     window_size: int
+    static_csa_plan: Optional[DeepSeekV4CPStaticCSAPlan] = None
 
     @property
     def seq_dim(self):
@@ -334,6 +338,7 @@ def _build_runtime_sequence_metadata(
     device,
     packed_seq_params=None,
     layout="BSND",
+    return_static_csa_plan=False,
 ):
     if layout == "TND":
         query_token_count = int(query.shape[0])
@@ -420,13 +425,14 @@ def _build_runtime_sequence_metadata(
             local_seq_len=kv_token_count,
             device=device,
         )
-        return (
+        result = (
             query_metadata.cu_seqlens_q,
             kv_metadata.cu_seqlens_ori_kv,
             query_metadata.cu_seqlens,
             query_metadata.query_positions,
             kv_metadata.local_seq_offset,
         )
+        return (*result, None) if return_static_csa_plan else result
 
     cu_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * int(seq_len)
     cu_kv = torch.arange(batch_size + 1, dtype=torch.int32, device=device) * int(cp_local_kv_seq_len)
@@ -440,10 +446,21 @@ def _build_runtime_sequence_metadata(
     )
     sample_offsets = torch.arange(batch_size, dtype=torch.long, device=device) * global_sample_len
     query_positions = (local_positions.unsqueeze(0) + sample_offsets.unsqueeze(1)).reshape(-1)
-    return cu_q, cu_kv, cu_global, query_positions, kv_local_seq_offset
+    result = (cu_q, cu_kv, cu_global, query_positions, kv_local_seq_offset)
+    if return_static_csa_plan:
+        # This is the producer of both the device metadata and its Host contract.
+        # In particular query_local_seq_offset includes the TP/SP query offset.
+        plan = DeepSeekV4CPStaticCSAPlan(
+            batch_size=int(batch_size),
+            query_length=int(seq_len),
+            global_length=global_sample_len,
+            query_start=query_local_seq_offset,
+        )
+        return (*result, plan)
+    return result
 
 
-def _build_runtime(query, ori_kv, packed_seq_params, config, window_size, mtp_idx=0):
+def _build_runtime(query, ori_kv, packed_seq_params, config, window_size, mtp_idx=0, use_static_csa=False):
     del mtp_idx
     layout = "TND" if packed_seq_params is not None else "BSND"
     query_cp = _model_tensor_to_cp_layout(query, layout)
@@ -454,13 +471,7 @@ def _build_runtime(query, ori_kv, packed_seq_params, config, window_size, mtp_id
     cp_rank = parallel_state.get_context_parallel_rank()
     tp_size = parallel_state.get_tensor_model_parallel_world_size()
     tp_rank = parallel_state.get_tensor_model_parallel_rank()
-    (
-        cu_q,
-        cu_kv,
-        global_cu,
-        positions,
-        local_offset,
-    ) = _build_runtime_sequence_metadata(
+    sequence_metadata = _build_runtime_sequence_metadata(
         query_cp,
         ori_kv_cp,
         seq_len,
@@ -473,7 +484,13 @@ def _build_runtime(query, ori_kv, packed_seq_params, config, window_size, mtp_id
         query.device,
         packed_seq_params=packed_seq_params,
         layout=layout,
+        return_static_csa_plan=use_static_csa,
     )
+    static_csa_plan = None
+    if use_static_csa:
+        cu_q, cu_kv, global_cu, positions, local_offset, static_csa_plan = sequence_metadata
+    else:
+        cu_q, cu_kv, global_cu, positions, local_offset = sequence_metadata
     return _CPRuntime(
         layout=layout,
         query=query_cp,
@@ -490,6 +507,7 @@ def _build_runtime(query, ori_kv, packed_seq_params, config, window_size, mtp_id
         batch_size=batch_size,
         seq_len=seq_len,
         window_size=max(int(window_size), 1),
+        static_csa_plan=static_csa_plan,
     )
 
 
@@ -625,6 +643,7 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
         )
         self.compressor = None
         self.indexer = None
+        self._indexer_query_weights_stream = None
         self.compress_ratio = 1
         if not self.enable_compression:
             self.mode = LayerCompressMode.NO_COMPRESS
@@ -702,7 +721,42 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
         kv[..., -self.rope_head_dim :] = apply_rotary_emb(kv[..., -self.rope_head_dim :], kv_freqs)
         return q.transpose(0, 1), kv.transpose(0, 1)
 
-    def _prepare_compressed_kv(self, runtime, source, freqs, ratio):
+    def _launch_indexer_query_weights(self, hidden_states, q_compressed, local_freqs):
+        """Enqueue local Indexer projections without blocking the main compressor."""
+        device = hidden_states.device
+        producer = torch.npu.current_stream(device)
+        stream = self._indexer_query_weights_stream
+        if stream is None or stream.device != device:
+            stream = torch.npu.Stream(device=device)
+            self._indexer_query_weights_stream = stream
+
+        # Capture only work already submitted by the producer. In particular,
+        # the main compressor and its collective have not been enqueued yet.
+        stream.wait_stream(producer)
+        hidden_states = hidden_states.detach()
+        q_compressed = q_compressed.detach()
+        with torch.npu.stream(stream):
+            for tensor in (hidden_states, q_compressed, local_freqs):
+                tensor.record_stream(stream)
+            # Preserve the caller's grad mode: checkpoint recomputation must
+            # retain the projection-parameter graph for the Indexer KL loss.
+            query_index, weights = self.indexer.forward_query_weights(
+                hidden_states, q_compressed, local_freqs,
+            )
+            completed = torch.npu.Event()
+            completed.record(stream)
+        # Reuse the stream, never results or events from another microbatch.
+        return query_index, weights, completed
+
+    def _wait_indexer_query_weights(self, pending):
+        query_index, weights, completed = pending
+        consumer = torch.npu.current_stream(query_index.device)
+        consumer.wait_event(completed)
+        query_index.record_stream(consumer)
+        weights.record_stream(consumer)
+        return query_index, weights
+
+    def _prepare_compressed_kv(self, runtime, source, freqs, ratio, indexer_query_inputs=None):
         previous_ori = None
         previous_source = None
         if ratio > 1:
@@ -719,7 +773,11 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
             cp_group=runtime.cp_group,
             cp_global_ranks=runtime.cp_global_ranks,
             seq_dim=runtime.seq_dim,
-            cu_seqlens=runtime.cu_seqlens_global,
+            cu_seqlens=(
+                runtime.static_csa_plan.global_cu_values
+                if getattr(runtime, "static_csa_plan", None) is not None
+                else runtime.cu_seqlens_global
+            ),
             local_seq_offset=runtime.local_seq_offset,
             include_left_context=ratio == 4,
             previous_tail=previous_source,
@@ -736,14 +794,8 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 candidates.candidate_blocks,
                 getattr(candidates.compress_context, "valid_mask", None),
             )
-        local_compressed = _CPCompressor(
-            self.compressor,
-            freqs,
-            not runtime.is_bsnd,
-            prepared_candidate=shared_candidate,
-        ).compress(candidates.candidate_blocks, candidates.compress_context)
-        pending = launch_deepseek_v4_allgather_compressed_kv(candidates, local_compressed)
         indexer_pending = None
+        query_weights_pending = None
         if self.indexer is not None and getattr(self.indexer, "kv_compressor", None) is not None:
             indexer_candidates = replace(
                 candidates,
@@ -775,12 +827,24 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 indexer_candidates,
                 indexer_compressed,
             )
+            if indexer_query_inputs is not None:
+                query_weights_pending = self._launch_indexer_query_weights(*indexer_query_inputs)
+        # Issue the Indexer collective first so its keys can be consumed while
+        # the main compressed-KV all-gather is still in flight.
+        local_compressed = _CPCompressor(
+            self.compressor,
+            freqs,
+            not runtime.is_bsnd,
+            prepared_candidate=shared_candidate,
+        ).compress(candidates.candidate_blocks, candidates.compress_context)
+        pending = launch_deepseek_v4_allgather_compressed_kv(candidates, local_compressed)
         return (
             previous_ori,
             previous_source,
             candidates,
             pending,
             indexer_pending,
+            query_weights_pending,
         )
 
     def _windowed_ori_kv(self, runtime, previous_ori, packed):
@@ -875,6 +939,13 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
             self.config,
             max(self.window_size, self.compress_ratio),
             mtp_idx=self.mtp_idx,
+            use_static_csa=(
+                bool(getattr(args, "deepseek_v4_cp_static_csa", False))
+                and self.compress_ratio == 4
+                and self.indexer is not None
+                and bool(getattr(args, "use_fused_lightning_indexer", False))
+                and packed_seq_params is None
+            ),
         )
         ratio = self.compress_ratio
         ori_windowed = None
@@ -886,12 +957,16 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
         query_index = key_index = weights = None
         previous_ori = previous_source = None
         if ratio > 1:
+            indexer_query_inputs = None
+            if self.indexer is not None and bool(getattr(args, "deepseek_v4_cp_indexer_query_overlap", False)):
+                indexer_query_inputs = (hidden_for_compress, q_compressed, local_freqs)
             (
                 previous_ori,
                 previous_source,
                 candidates,
                 pending,
                 indexer_pending,
+                query_weights_pending,
             ) = self._prepare_compressed_kv(
                 runtime,
                 (
@@ -905,29 +980,26 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 ),
                 global_freqs if packed_seq_params is None else global_freqs,
                 ratio,
-            )
-            prepared_kv = wait_deepseek_v4_compressed_kv(pending)
-            compacted_kv, block_starts = compact_deepseek_v4_compressed_kv(
-                prepared_kv,
-                seq_dim=runtime.seq_dim,
-            )
-            ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
-                runtime,
-                previous_ori,
-                packed_seq_params is not None,
+                indexer_query_inputs=indexer_query_inputs,
             )
             if self.indexer is not None:
                 if indexer_pending is None:
                     raise RuntimeError("C4A requires an indexer compressed-key path.")
-                indexer_key, _ = compact_deepseek_v4_compressed_kv(
-                    wait_deepseek_v4_compressed_kv(indexer_pending),
+                if query_weights_pending is None:
+                    # Keep the original single-compute-stream path for A/B runs.
+                    query_index, weights = self.indexer.forward_query_weights(
+                        hidden_for_compress.detach(),
+                        q_compressed.detach(),
+                        local_freqs,
+                    )
+                prepared_indexer = wait_deepseek_v4_compressed_kv(indexer_pending)
+                indexer_key, indexer_block_starts = compact_deepseek_v4_compressed_kv(
+                    prepared_indexer,
                     seq_dim=runtime.seq_dim,
                 )
-                query_index, weights = self.indexer.forward_query_weights(
-                    hidden_for_compress.detach(),
-                    q_compressed.detach(),
-                    local_freqs,
-                )
+                # Both compressors share the candidate metadata and compact
+                # order. Top-k needs only Indexer keys and their block starts,
+                # not the main KV values or completion of their all-gather.
                 if runtime.is_bsnd:
                     key_index = indexer_key
                 elif indexer_key.dim() == 4:
@@ -939,8 +1011,27 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 else:
                     key_index = indexer_key
 
+                if query_weights_pending is not None:
+                    # Join only at the first consumer, after the main AG launch
+                    # and Indexer Key preparation. Collectives stay on this stream.
+                    query_index, weights = self._wait_indexer_query_weights(query_weights_pending)
                 use_fused_indexer = bool(getattr(args, "use_fused_lightning_indexer", False))
                 if use_fused_indexer:
+                    static_plan = getattr(runtime, "static_csa_plan", None)
+                    if static_plan is not None and not (
+                        prepared_indexer.metadata.is_identity_compact_order
+                        and prepared_indexer.metadata.batch_shared_sequence
+                    ):
+                        # Keep the general path for metadata not produced by the
+                        # fixed BSND identity-order compression contract.
+                        runtime = replace(runtime, static_csa_plan=None)
+                        static_plan = None
+                    indexer_positions = None if static_plan is not None else (
+                        runtime.shared_query_positions() if runtime.is_bsnd else runtime.query_positions
+                    )
+                    indexer_shared_cu = None if static_plan is not None else (
+                        runtime.shared_cu_seqlens_global() if runtime.is_bsnd else runtime.cu_seqlens_global
+                    )
                     with torch.no_grad():
                         cmp = run_deepseek_v4_right_aligned_fused_indexer(
                             self.indexer,
@@ -948,27 +1039,28 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                             query_index,
                             key_index,
                             weights,
-                            (runtime.shared_query_positions() if runtime.is_bsnd else runtime.query_positions),
+                            indexer_positions,
                             runtime.cu_seqlens_global,
                             ratio,
                             self.indexer.index_topk,
                             0,
                             identity_single_sample=(
                                 packed_seq_params is None
-                                and bool(getattr(prepared_kv.metadata, "is_identity_compact_order", False))
+                                and bool(getattr(prepared_indexer.metadata, "is_identity_compact_order", False))
                                 and (runtime.batch_size == 1 or runtime.is_bsnd)
                             ),
                             layout=runtime.layout,
+                            static_csa_plan=static_plan,
                         )
                     cmp, cmp_is_causal = finalize_deepseek_v4_fused_indexer_compact_indices(
                         cmp,
-                        block_starts,
+                        indexer_block_starts,
                         ratio,
-                        runtime.shared_cu_seqlens_global() if runtime.is_bsnd else runtime.cu_seqlens_global,
-                        runtime.shared_query_positions() if runtime.is_bsnd else runtime.query_positions,
+                        indexer_shared_cu,
+                        indexer_positions,
                         identity_compact_order=(
                             packed_seq_params is None
-                            and bool(getattr(prepared_kv.metadata, "is_identity_compact_order", False))
+                            and bool(getattr(prepared_indexer.metadata, "is_identity_compact_order", False))
                             and (runtime.batch_size == 1 or runtime.is_bsnd)
                         ),
                         layout=runtime.layout,
@@ -981,13 +1073,25 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                         key_index,
                         weights,
                         runtime.query_positions,
-                        block_starts,
+                        indexer_block_starts,
                         ratio,
                         runtime.cu_seqlens_global,
                         self.indexer.index_topk,
                         layout=runtime.layout,
                     )
-            elif ratio == 4:
+            # Defer the main KV dependency until after Indexer top-k, allowing
+            # both Indexer projections and selection to hide its communication.
+            prepared_kv = wait_deepseek_v4_compressed_kv(pending)
+            compacted_kv, block_starts = compact_deepseek_v4_compressed_kv(
+                prepared_kv,
+                seq_dim=runtime.seq_dim,
+            )
+            ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
+                runtime,
+                previous_ori,
+                packed_seq_params is not None,
+            )
+            if self.indexer is None and ratio == 4:
                 valid_mask = torch.ones_like(block_starts, dtype=torch.bool)
                 cmp = build_deepseek_v4_causal_cmp_sparse_indices(
                     runtime.query_positions,
@@ -999,8 +1103,6 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
                 )
                 if runtime.is_bsnd:
                     cmp = cmp.reshape(runtime.batch_size, runtime.seq_len, -1)
-            else:
-                cmp = None
         else:
             ori_windowed, cu_ori_windowed = self._windowed_ori_kv(
                 runtime,
@@ -1040,6 +1142,7 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
             local_seq_offset=runtime.local_seq_offset,
             batch_size=runtime.batch_size if runtime.is_bsnd else 1,
             compression_ratio=ratio,
+            static_csa_plan=getattr(runtime, "static_csa_plan", None),
         )
         cp = DeepSeekV4CPContextParallel(
             compression_ratio=ratio,
