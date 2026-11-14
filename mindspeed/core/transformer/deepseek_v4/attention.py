@@ -17,6 +17,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 from megatron.training import get_args
 
 from mindspeed.core.context_parallel.deepseek_v4_context_parallel import (
@@ -525,6 +526,14 @@ class DeepSeekV4SelfAttentionCP(MegatronModule):
     """MindSpeed-owned DeepSeek-V4 attention for ``deepseek_v4_cp_algo``."""
 
     enable_compression = True
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        state = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        # Each TP rank owns a different range of attention heads.
+        state[f'{prefix}attn_sink'] = make_tp_sharded_tensor_for_checkpoint(
+            self.attn_sink, f'{prefix}attn_sink', 0, prepend_offsets=sharded_offsets
+        )
+        return state
 
     def __init__(
         self,
